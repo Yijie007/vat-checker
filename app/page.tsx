@@ -11,6 +11,18 @@ type ParsedVat = {
   message: string;
 };
 
+type AuditLogRecord = {
+  vat: string;
+  attempt: number;
+  dateTime: string;
+  addressLocation: string;
+  validationVat: string;
+  soapResult: string;
+  source: string;
+  httpStatus?: number;
+  errorMessage?: string;
+};
+
 type ApiResult = {
   vat: string;
   status: "VALID" | "INVALID" | "UNAVAILABLE";
@@ -19,6 +31,8 @@ type ApiResult = {
   source: string;
   checkedAt: string;
   message: string;
+  attempts: number;
+  auditLog: AuditLogRecord[];
 };
 
 function parseVat(raw: string): ParsedVat {
@@ -51,12 +65,53 @@ function parseVat(raw: string): ParsedVat {
   };
 }
 
+function getTodayString() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function buildFileName(input: string, fallbackPrefix: string) {
+  const trimmed = input.trim();
+
+  if (!trimmed) {
+    return `${fallbackPrefix}-${getTodayString()}.csv`;
+  }
+
+  const safeName = trimmed.replace(/[<>:"/\\|?*\x00-\x1F]/g, "-").trim();
+  return safeName.endsWith(".csv") ? safeName : `${safeName}.csv`;
+}
+
+function downloadCsv(rows: (string | number | boolean)[][], fileName: string) {
+  const csvContent = rows
+    .map((row) =>
+      row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(",")
+    )
+    .join("\n");
+
+  const blob = new Blob([csvContent], {
+    type: "text/csv;charset=utf-8;",
+  });
+
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = url;
+  link.setAttribute("download", fileName);
+
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+
+  URL.revokeObjectURL(url);
+}
+
 export default function Home() {
   const [input, setInput] = useState("");
   const [submitted, setSubmitted] = useState<string[]>([]);
   const [results, setResults] = useState<ApiResult[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [apiError, setApiError] = useState("");
+  const [exportFileName, setExportFileName] = useState("");
+  const [logbookFileName, setLogbookFileName] = useState("");
 
   const parsedVats = useMemo(() => {
     return submitted
@@ -121,6 +176,61 @@ export default function Home() {
     return results.find((r) => r.vat === cleanedVat);
   }
 
+  function getStatusStyle(status: string) {
+    if (status === "VALID") {
+      return {
+        color: "#137333",
+        backgroundColor: "#e6f4ea",
+        fontWeight: "bold" as const,
+        padding: "4px 8px",
+        borderRadius: "999px",
+        display: "inline-block",
+      };
+    }
+
+    if (status === "INVALID") {
+      return {
+        color: "#b3261e",
+        backgroundColor: "#fce8e6",
+        fontWeight: "bold" as const,
+        padding: "4px 8px",
+        borderRadius: "999px",
+        display: "inline-block",
+      };
+    }
+
+    if (status === "UNAVAILABLE") {
+      return {
+        color: "#b06000",
+        backgroundColor: "#fff4e5",
+        fontWeight: "bold" as const,
+        padding: "4px 8px",
+        borderRadius: "999px",
+        display: "inline-block",
+      };
+    }
+
+    if (status === "FORMAT_ERROR") {
+      return {
+        color: "#5f6368",
+        backgroundColor: "#f1f3f4",
+        fontWeight: "bold" as const,
+        padding: "4px 8px",
+        borderRadius: "999px",
+        display: "inline-block",
+      };
+    }
+
+    return {
+      color: "#5f6368",
+      backgroundColor: "#f1f3f4",
+      fontWeight: "bold" as const,
+      padding: "4px 8px",
+      borderRadius: "999px",
+      display: "inline-block",
+    };
+  }
+
   function handleExportCsv() {
     if (parsedVats.length === 0) return;
 
@@ -134,6 +244,7 @@ export default function Home() {
       "Address",
       "Source",
       "Checked At",
+      "Attempts",
       "Message",
     ];
 
@@ -152,7 +263,7 @@ export default function Home() {
           ? result.message
           : isLoading
           ? "Waiting for API response..."
-           : "No API result yet.";
+          : "No API result yet.";
 
       return [
         vat.original,
@@ -164,33 +275,50 @@ export default function Home() {
         result?.address || "",
         result?.source || "",
         result?.checkedAt || "",
+        result?.attempts || "",
         finalMessage,
       ];
     });
 
-    const csvContent = [headers, ...rows]
-      .map((row) =>
-        row
-          .map((cell) => `"${String(cell).replace(/"/g, '""')}"`)
-          .join(",")
-      )
-      .join("\n");
+    downloadCsv(
+      [headers, ...rows],
+      buildFileName(exportFileName, "vat-checker")
+    );
+  }
 
-    const blob = new Blob([csvContent], {
-      type: "text/csv;charset=utf-8;",
-    });
+  function handleExportLogbook() {
+    const allLogs = results.flatMap((result) => result.auditLog || []);
 
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
+    if (allLogs.length === 0) return;
 
-    link.href = url;
-    link.setAttribute("download", "vat-validation-results.csv");
+    const headers = [
+      "VAT",
+      "Attempt",
+      "Date and Time",
+      "Address Location",
+      "Validation VAT (SOAP)",
+      "SOAP Result",
+      "Source",
+      "HTTP Status",
+      "Error Message",
+    ];
 
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    const rows = allLogs.map((log) => [
+      log.vat,
+      log.attempt,
+      log.dateTime,
+      log.addressLocation,
+      log.validationVat,
+      log.soapResult,
+      log.source,
+      log.httpStatus ?? "",
+      log.errorMessage ?? "",
+    ]);
 
-    URL.revokeObjectURL(url);
+    downloadCsv(
+      [headers, ...rows],
+      buildFileName(logbookFileName, "logbook")
+    );
   }
 
   return (
@@ -198,7 +326,7 @@ export default function Home() {
       style={{
         padding: "40px",
         fontFamily: "Arial, sans-serif",
-        maxWidth: "1100px",
+        maxWidth: "1280px",
         margin: "0 auto",
       }}
     >
@@ -229,48 +357,65 @@ BE0123456789`}
         }}
       />
 
-      <div style={{ display: "flex", gap: "12px", marginTop: "20px" }}>
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "1fr 1fr",
+          gap: "12px",
+          marginTop: "20px",
+        }}
+      >
+        <div>
+          <label style={{ display: "block", marginBottom: "6px", fontWeight: 600 }}>
+            Export CSV file name
+          </label>
+          <input
+            value={exportFileName}
+            onChange={(e) => setExportFileName(e.target.value)}
+            placeholder="Optional. Default: vat-checker-YYYY-MM-DD.csv"
+            style={inputStyle}
+          />
+        </div>
+
+        <div>
+          <label style={{ display: "block", marginBottom: "6px", fontWeight: 600 }}>
+            Logbook file name
+          </label>
+          <input
+            value={logbookFileName}
+            onChange={(e) => setLogbookFileName(e.target.value)}
+            placeholder="Optional. Default: logbook-YYYY-MM-DD.csv"
+            style={inputStyle}
+          />
+        </div>
+      </div>
+
+      <div
+        style={{
+          display: "flex",
+          gap: "12px",
+          marginTop: "20px",
+          flexWrap: "wrap",
+        }}
+      >
         <button
           onClick={handleValidate}
           disabled={isLoading}
-          style={{
-            padding: "10px 18px",
-            fontSize: "16px",
-            border: "1px solid #ccc",
-            borderRadius: "8px",
-            cursor: "pointer",
-            background: "#fff",
-          }}
+          style={buttonStyle}
         >
           {isLoading ? "Validating..." : "Validate"}
         </button>
 
-        <button
-          onClick={handleClear}
-          style={{
-            padding: "10px 18px",
-            fontSize: "16px",
-            border: "1px solid #ccc",
-            borderRadius: "8px",
-            cursor: "pointer",
-            background: "#fff",
-          }}
-        >
+        <button onClick={handleClear} style={buttonStyle}>
           Clear
         </button>
 
-        <button
-          onClick={handleExportCsv}
-          style={{
-            padding: "10px 18px",
-            fontSize: "16px",
-            border: "1px solid #ccc",
-            borderRadius: "8px",
-            cursor: "pointer",
-            background: "#fff",
-          }}
-        >
+        <button onClick={handleExportCsv} style={buttonStyle}>
           Export CSV
+        </button>
+
+        <button onClick={handleExportLogbook} style={buttonStyle}>
+          Export Logbook
         </button>
       </div>
 
@@ -289,7 +434,7 @@ BE0123456789`}
               style={{
                 width: "100%",
                 borderCollapse: "collapse",
-                minWidth: "1100px",
+                minWidth: "1300px",
               }}
             >
               <thead>
@@ -303,6 +448,7 @@ BE0123456789`}
                   <th style={thStyle}>Address</th>
                   <th style={thStyle}>Source</th>
                   <th style={thStyle}>Checked At</th>
+                  <th style={thStyle}>Attempts</th>
                   <th style={thStyle}>Message</th>
                 </tr>
               </thead>
@@ -319,7 +465,7 @@ BE0123456789`}
                     vat.status === "FORMAT_ERROR"
                       ? vat.message
                       : result
-                      ? "Validation completed."
+                      ? result.message
                       : isLoading
                       ? "Waiting for API response..."
                       : "No API result yet.";
@@ -330,11 +476,16 @@ BE0123456789`}
                       <td style={tdStyle}>{vat.cleaned}</td>
                       <td style={tdStyle}>{vat.countryCode}</td>
                       <td style={tdStyle}>{vat.vatNumber}</td>
-                      <td style={tdStyle}>{finalStatus}</td>
+                      <td style={tdStyle}>
+                        <span style={getStatusStyle(finalStatus)}>
+                          {finalStatus}
+                        </span>
+                      </td>
                       <td style={tdStyle}>{result?.name || "-"}</td>
                       <td style={tdStyle}>{result?.address || "-"}</td>
                       <td style={tdStyle}>{result?.source || "-"}</td>
                       <td style={tdStyle}>{result?.checkedAt || "-"}</td>
+                      <td style={tdStyle}>{result?.attempts || "-"}</td>
                       <td style={tdStyle}>{finalMessage}</td>
                     </tr>
                   );
@@ -347,6 +498,24 @@ BE0123456789`}
     </main>
   );
 }
+
+const inputStyle = {
+  width: "100%",
+  padding: "10px 12px",
+  fontSize: "14px",
+  border: "1px solid #ccc",
+  borderRadius: "8px",
+  boxSizing: "border-box" as const,
+};
+
+const buttonStyle = {
+  padding: "10px 18px",
+  fontSize: "16px",
+  border: "1px solid #ccc",
+  borderRadius: "8px",
+  cursor: "pointer",
+  background: "#fff",
+};
 
 const thStyle = {
   textAlign: "left" as const,
