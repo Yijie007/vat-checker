@@ -106,7 +106,7 @@ function downloadCsv(
     "\uFEFF" +
     rows
       .map((row) =>
-        row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(",")
+        row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(";")
       )
       .join("\n");
 
