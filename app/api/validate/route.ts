@@ -1,31 +1,51 @@
 import { NextResponse } from "next/server";
+import crypto from "crypto";
 
 type ValidationStatus = "VALID" | "INVALID" | "UNAVAILABLE";
 
 type AuditRecord = {
-  vat: string;
+  recordId: string;
+  batchId: string;
+  toolVersion: string;
+  requesterVat: string;
+  targetVat: string;
   attempt: number;
   dateTime: string;
+  countryCode: string;
+  vatNumber: string;
+  soapAction: "checkVatApprox";
   addressLocation: string;
   validationVat: string;
   soapResult: string;
+  consultationNumber: string;
+  rawRequestIdentifier: string;
+  requestDurationMs: number;
   source: "VIES";
+  retryReason: string;
+  finalOutcomeForThisVat: ValidationStatus | "";
+  companyName: string;
+  companyAddress: string;
   httpStatus?: number;
   errorMessage?: string;
 };
 
 type ValidationResult = {
-  vat: string;
-  status: ValidationStatus;
-  name: string;
-  address: string;
+  checkResult: ValidationStatus;
+  countryCode: string;
+  vatNumber: string;
+  companyName: string;
+  companyAddress: string;
+  checkDate: string;
+  consultationNumber: string;
+  consultationNumberAvailable: boolean;
+  requesterVat: string;
   source: "VIES";
-  checkedAt: string;
   message: string;
   attempts: number;
   auditLog: AuditRecord[];
 };
 
+const TOOL_VERSION = "V3.3";
 const VIES_ENDPOINT =
   "https://ec.europa.eu/taxation_customs/vies/services/checkVatService";
 
@@ -51,12 +71,11 @@ function extractTagValue(xml: string, tagName: string): string {
     `<(?:\\w+:)?${tagName}>([\\s\\S]*?)</(?:\\w+:)?${tagName}>`,
     "i"
   );
-
   const match = xml.match(regex);
   return match?.[1]?.trim() ?? "";
 }
 
-function normalizeReturnedField(value: string): string {
+function normalizeReturnedField(value: string) {
   const cleaned = value.replace(/\s+/g, " ").trim();
   if (!cleaned || cleaned === "---") return "";
   return cleaned;
@@ -67,10 +86,36 @@ function buildAddressLocation(name: string, address: string) {
   return parts.join(" | ");
 }
 
-async function callViesOnce(
-  vat: string,
-  attempt: number
-): Promise<
+function parseVatParts(vat: string) {
+  const cleaned = vat.replace(/[\s.\-]/g, "").toUpperCase();
+  return {
+    cleaned,
+    countryCode: cleaned.slice(0, 2),
+    vatNumber: cleaned.slice(2),
+  };
+}
+
+function isLikelyViesConsultationNumber(value: string) {
+  if (!value) return false;
+
+  const trimmed = value.trim();
+
+  const uuidRegex =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  if (uuidRegex.test(trimmed)) {
+    return false;
+  }
+
+  const viesLikeRegex = /^[A-Za-z0-9]{8,40}$/;
+  return viesLikeRegex.test(trimmed);
+}
+
+function sanitizeConsultationNumber(rawValue: string) {
+  return isLikelyViesConsultationNumber(rawValue) ? rawValue.trim() : "";
+}
+
+type CallResult =
   | {
       success: true;
       result: Omit<ValidationResult, "auditLog">;
@@ -78,15 +123,21 @@ async function callViesOnce(
     }
   | {
       success: false;
-      retryable: true;
       message: string;
       auditRecord: AuditRecord;
-    }
-> {
+    };
+
+async function callViesOnce(
+  batchId: string,
+  requesterVat: string,
+  targetVat: string,
+  attempt: number
+): Promise<CallResult> {
+  const start = Date.now();
   const dateTime = new Date().toISOString();
 
-  const countryCode = vat.slice(0, 2).toUpperCase();
-  const vatNumber = vat.slice(2).toUpperCase();
+  const requester = parseVatParts(requesterVat);
+  const target = parseVatParts(targetVat);
 
   const soapEnvelope = `<?xml version="1.0" encoding="UTF-8"?>
 <soapenv:Envelope
@@ -94,10 +145,16 @@ async function callViesOnce(
   xmlns:urn="urn:ec.europa.eu:taxud:vies:services:checkVat:types">
   <soapenv:Header/>
   <soapenv:Body>
-    <urn:checkVat>
-      <urn:countryCode>${escapeXml(countryCode)}</urn:countryCode>
-      <urn:vatNumber>${escapeXml(vatNumber)}</urn:vatNumber>
-    </urn:checkVat>
+    <urn:checkVatApprox>
+      <urn:countryCode>${escapeXml(target.countryCode)}</urn:countryCode>
+      <urn:vatNumber>${escapeXml(target.vatNumber)}</urn:vatNumber>
+      <urn:requesterCountryCode>${escapeXml(
+        requester.countryCode
+      )}</urn:requesterCountryCode>
+      <urn:requesterVatNumber>${escapeXml(
+        requester.vatNumber
+      )}</urn:requesterVatNumber>
+    </urn:checkVatApprox>
   </soapenv:Body>
 </soapenv:Envelope>`;
 
@@ -117,27 +174,44 @@ async function callViesOnce(
     });
 
     const xml = await response.text();
+    const requestDurationMs = Date.now() - start;
 
     if (!response.ok) {
       const faultString =
         extractTagValue(xml, "faultstring") ||
         `HTTP ${response.status} from VIES`;
 
+      const rawRequestIdentifier = extractTagValue(xml, "requestIdentifier");
+      const consultationNumber = sanitizeConsultationNumber(rawRequestIdentifier);
+
       const auditRecord: AuditRecord = {
-        vat,
+        recordId: crypto.randomUUID(),
+        batchId,
+        toolVersion: TOOL_VERSION,
+        requesterVat,
+        targetVat,
         attempt,
         dateTime,
+        countryCode: target.countryCode,
+        vatNumber: target.vatNumber,
+        soapAction: "checkVatApprox",
         addressLocation: "",
-        validationVat: vat,
+        validationVat: targetVat,
         soapResult: "HTTP_ERROR",
+        consultationNumber,
+        rawRequestIdentifier,
+        requestDurationMs,
         source: "VIES",
+        retryReason: "",
+        finalOutcomeForThisVat: "",
+        companyName: "",
+        companyAddress: "",
         httpStatus: response.status,
         errorMessage: faultString,
       };
 
       return {
         success: false,
-        retryable: true,
         message: faultString,
         auditRecord,
       };
@@ -145,77 +219,131 @@ async function callViesOnce(
 
     const faultString = extractTagValue(xml, "faultstring");
     if (faultString) {
+      const rawRequestIdentifier = extractTagValue(xml, "requestIdentifier");
+      const consultationNumber = sanitizeConsultationNumber(rawRequestIdentifier);
+
       const auditRecord: AuditRecord = {
-        vat,
+        recordId: crypto.randomUUID(),
+        batchId,
+        toolVersion: TOOL_VERSION,
+        requesterVat,
+        targetVat,
         attempt,
         dateTime,
+        countryCode: target.countryCode,
+        vatNumber: target.vatNumber,
+        soapAction: "checkVatApprox",
         addressLocation: "",
-        validationVat: vat,
+        validationVat: targetVat,
         soapResult: "SOAP_FAULT",
+        consultationNumber,
+        rawRequestIdentifier,
+        requestDurationMs,
         source: "VIES",
+        retryReason: "",
+        finalOutcomeForThisVat: "",
+        companyName: "",
+        companyAddress: "",
         errorMessage: faultString,
       };
 
       return {
         success: false,
-        retryable: true,
         message: faultString,
         auditRecord,
       };
     }
 
     const validRaw = extractTagValue(xml, "valid");
-    const nameRaw = extractTagValue(xml, "name");
-    const addressRaw = extractTagValue(xml, "address");
+    const traderNameRaw =
+      extractTagValue(xml, "traderName") || extractTagValue(xml, "name");
+    const traderAddressRaw =
+      extractTagValue(xml, "traderAddress") || extractTagValue(xml, "address");
+    const rawRequestIdentifier = extractTagValue(xml, "requestIdentifier");
+    const consultationNumber = sanitizeConsultationNumber(rawRequestIdentifier);
 
     const isValid = validRaw.toLowerCase() === "true";
-    const name = normalizeReturnedField(nameRaw);
-    const address = normalizeReturnedField(addressRaw);
+    const companyName = normalizeReturnedField(traderNameRaw);
+    const companyAddress = normalizeReturnedField(traderAddressRaw);
 
     const auditRecord: AuditRecord = {
-      vat,
+      recordId: crypto.randomUUID(),
+      batchId,
+      toolVersion: TOOL_VERSION,
+      requesterVat,
+      targetVat,
       attempt,
       dateTime,
-      addressLocation: buildAddressLocation(name, address),
-      validationVat: vat,
+      countryCode: target.countryCode,
+      vatNumber: target.vatNumber,
+      soapAction: "checkVatApprox",
+      addressLocation: buildAddressLocation(companyName, companyAddress),
+      validationVat: targetVat,
       soapResult: isValid ? "VALID VAT" : "INVALID VAT",
+      consultationNumber,
+      rawRequestIdentifier,
+      requestDurationMs,
       source: "VIES",
+      retryReason: "",
+      finalOutcomeForThisVat: "",
+      companyName,
+      companyAddress,
     };
 
     return {
       success: true,
       result: {
-        vat,
-        status: isValid ? "VALID" : "INVALID",
-        name,
-        address,
+        checkResult: isValid ? "VALID" : "INVALID",
+        countryCode: target.countryCode,
+        vatNumber: target.vatNumber,
+        companyName,
+        companyAddress,
+        checkDate: dateTime,
+        consultationNumber,
+        consultationNumberAvailable: Boolean(consultationNumber),
+        requesterVat,
         source: "VIES",
-        checkedAt: dateTime,
         message: isValid
-          ? "Validation completed."
+          ? consultationNumber
+            ? "Validation completed."
+            : "Validation completed, but consultation number unavailable."
           : "Invalid VAT number.",
         attempts: attempt,
       },
       auditRecord,
     };
   } catch (error) {
+    const requestDurationMs = Date.now() - start;
     const message =
       error instanceof Error ? error.message : "Unknown network error";
 
     const auditRecord: AuditRecord = {
-      vat,
+      recordId: crypto.randomUUID(),
+      batchId,
+      toolVersion: TOOL_VERSION,
+      requesterVat,
+      targetVat,
       attempt,
       dateTime,
+      countryCode: target.countryCode,
+      vatNumber: target.vatNumber,
+      soapAction: "checkVatApprox",
       addressLocation: "",
-      validationVat: vat,
+      validationVat: targetVat,
       soapResult: "NETWORK_ERROR",
+      consultationNumber: "",
+      rawRequestIdentifier: "",
+      requestDurationMs,
       source: "VIES",
+      retryReason: "",
+      finalOutcomeForThisVat: "",
+      companyName: "",
+      companyAddress: "",
       errorMessage: message,
     };
 
     return {
       success: false,
-      retryable: true,
       message,
       auditRecord,
     };
@@ -224,35 +352,90 @@ async function callViesOnce(
   }
 }
 
-async function validateViaViesWithRetry(vat: string): Promise<ValidationResult> {
+async function validateViaViesWithRetry(
+  batchId: string,
+  requesterVat: string,
+  targetVat: string
+): Promise<ValidationResult> {
   const auditLog: AuditRecord[] = [];
   let lastErrorMessage = "VIES unavailable after retries.";
+  const target = parseVatParts(targetVat);
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    const result = await callViesOnce(vat, attempt);
-    auditLog.push(result.auditRecord);
+    const result = await callViesOnce(batchId, requesterVat, targetVat, attempt);
 
     if (result.success) {
-      return {
-        ...result.result,
-        auditLog,
-      };
-    }
+      const needsConsultationRetry =
+        result.result.checkResult === "VALID" &&
+        !result.result.consultationNumberAvailable;
 
-    lastErrorMessage = result.message;
+      result.auditRecord.retryReason = needsConsultationRetry
+        ? "missing_consultation_number"
+        : "";
+
+      auditLog.push(result.auditRecord);
+
+      if (!needsConsultationRetry) {
+        auditLog[auditLog.length - 1].finalOutcomeForThisVat =
+          result.result.checkResult;
+
+        return {
+          ...result.result,
+          auditLog,
+        };
+      }
+
+      lastErrorMessage = "Validation completed, but consultation number unavailable.";
+    } else {
+      result.auditRecord.retryReason = "request_failed";
+      auditLog.push(result.auditRecord);
+      lastErrorMessage = result.message;
+    }
 
     if (attempt < MAX_RETRIES) {
       await sleep(RETRY_DELAY_MS);
     }
   }
 
+  if (auditLog.length > 0) {
+    const lastSuccessWithoutConsultation = auditLog.some(
+      (log) => log.soapResult === "VALID VAT"
+    );
+
+    if (lastSuccessWithoutConsultation) {
+      auditLog[auditLog.length - 1].finalOutcomeForThisVat = "VALID";
+
+      return {
+        checkResult: "VALID",
+        countryCode: target.countryCode,
+        vatNumber: target.vatNumber,
+        companyName: "",
+        companyAddress: "",
+        checkDate: new Date().toISOString(),
+        consultationNumber: "",
+        consultationNumberAvailable: false,
+        requesterVat,
+        source: "VIES",
+        message: "Validation completed, but consultation number unavailable.",
+        attempts: MAX_RETRIES,
+        auditLog,
+      };
+    }
+
+    auditLog[auditLog.length - 1].finalOutcomeForThisVat = "UNAVAILABLE";
+  }
+
   return {
-    vat,
-    status: "UNAVAILABLE",
-    name: "",
-    address: "",
+    checkResult: "UNAVAILABLE",
+    countryCode: target.countryCode,
+    vatNumber: target.vatNumber,
+    companyName: "",
+    companyAddress: "",
+    checkDate: new Date().toISOString(),
+    consultationNumber: "",
+    consultationNumberAvailable: false,
+    requesterVat,
     source: "VIES",
-    checkedAt: new Date().toISOString(),
     message: lastErrorMessage,
     attempts: MAX_RETRIES,
     auditLog,
@@ -269,15 +452,29 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const body = await request.json();
+
+    const requesterVat =
+      typeof body?.requesterVat === "string" ? body.requesterVat.trim() : "";
+
     const vats: string[] = Array.isArray(body?.vats) ? body.vats : [];
 
+    if (!requesterVat) {
+      return NextResponse.json(
+        { error: "requesterVat is required" },
+        { status: 400 }
+      );
+    }
+
+    const batchId = crypto.randomUUID();
     const uniqueVats = [...new Set(vats)];
 
     const results = await Promise.all(
-      uniqueVats.map((vat) => validateViaViesWithRetry(vat))
+      uniqueVats.map((vat) =>
+        validateViaViesWithRetry(batchId, requesterVat, vat)
+      )
     );
 
-    return NextResponse.json({ results });
+    return NextResponse.json({ results, batchId });
   } catch (error) {
     console.error("API error:", error);
 
